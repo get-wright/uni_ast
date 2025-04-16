@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -12,7 +13,11 @@ func main() {
 	// Parse command line arguments
 	filePath := flag.String("file", "", "Path to the source file to parse")
 	language := flag.String("lang", "", "Language of the source file (js, py, go, java, c, cpp, ts)")
-	outputFormat := flag.String("format", "pretty", "Output format (pretty, json)")
+	outputFormat := flag.String("format", "pretty", "Output format (pretty, json, symbols)")
+	useCache := flag.Bool("cache", true, "Use parsing cache for better performance")
+	strictMode := flag.Bool("strict", false, "Enable strict mode parsing")
+	ecmaVersion := flag.Int("ecma", 2020, "ECMAScript version for JavaScript parsing")
+	
 	flag.Parse()
 	
 	if *filePath == "" {
@@ -59,8 +64,22 @@ func main() {
 		os.Exit(1)
 	}
 	
+	// Configure parser
+	parser.SetOptions(ParserOptions{
+		StrictMode:       *strictMode,
+		TargetECMAScript: *ecmaVersion,
+		SourcePath:       *filePath,
+		IncludeComments:  true,
+	})
+	
 	// Parse the source
-	ast, err := parser.Parse(string(source))
+	var ast *Node
+	if *useCache {
+		ast, err = ParseWithCache(parser, string(source))
+	} else {
+		ast, err = parser.Parse(string(source))
+	}
+	
 	if err != nil {
 		fmt.Printf("Parse error: %v\n", err)
 		os.Exit(1)
@@ -72,10 +91,60 @@ func main() {
 		fmt.Printf("AST for %s file:\n", parser.GetLanguage())
 		PrintAST(ast, "")
 	case "json":
-		// TODO: Implement JSON output
-		fmt.Println("JSON output not yet implemented")
+		jsonData, err := ast.ToJSON()
+		if err != nil {
+			fmt.Printf("Error converting to JSON: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(jsonData))
+	case "symbols":
+		// Output symbol table
+		printSymbolTable(ast)
 	default:
 		fmt.Printf("Unknown output format: %s\n", *outputFormat)
 		os.Exit(1)
 	}
+}
+
+// Print symbol table
+func printSymbolTable(node *Node) {
+	fmt.Println("Symbol Table:")
+	
+	// Collect symbols from nodes
+	var symbols []*Symbol
+	visitor := &symbolCollector{symbols: &symbols}
+	node.Accept(visitor)
+	
+	// Print collected symbols
+	for _, sym := range symbols {
+		if sym == nil || sym.Definition == nil {
+			continue
+		}
+		
+		fmt.Printf("- %s (%s): defined at line %d, column %d\n",
+			sym.Name, sym.Kind, sym.Definition.Start.Line, sym.Definition.Start.Column)
+		
+		if len(sym.References) > 0 {
+			fmt.Printf("  References: ")
+			for i, ref := range sym.References {
+				if i > 0 {
+					fmt.Printf(", ")
+				}
+				fmt.Printf("line %d, column %d", ref.Start.Line, ref.Start.Column)
+			}
+			fmt.Println()
+		}
+	}
+}
+
+// Symbol collector visitor
+type symbolCollector struct {
+	symbols *[]*Symbol
+}
+
+func (s *symbolCollector) Visit(node *Node) Visitor {
+	if node.Symbol != nil && node.Symbol.Definition == node {
+		*s.symbols = append(*s.symbols, node.Symbol)
+	}
+	return s
 }

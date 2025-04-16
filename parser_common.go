@@ -1,17 +1,110 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Parser interface for language-specific parsers
 type Parser interface {
+	// Core parsing methods
+	Initialize(source string)
 	Parse(source string) (*Node, error)
 	GetLanguage() string
+	
+	// Specialized parsing methods
+	ParseExpression(source string) (*Node, error)
+	ParseStatement(source string) (*Node, error)
+	ParseType(source string) (*Node, error)
+	
+	// Configuration
+	SetOptions(options ParserOptions)
 }
 
-// ParserFactory creates a parser for a specific language
+// ParserOptions contains configuration options for parsers
+type ParserOptions struct {
+	StrictMode       bool
+	TargetECMAScript int    // For JavaScript/TypeScript
+	Dialect          string // For language-specific dialects
+	IncludeComments  bool
+	SourcePath       string // For import resolution
+}
+
+// ParseError represents a detailed parsing error
+type ParseError struct {
+	Line    int
+	Column  int
+	Message string
+	Context string // Surrounding code snippet
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("Parse error at line %d, column %d: %s\n%s", 
+		e.Line, e.Column, e.Message, e.Context)
+}
+
+// Symbol represents a named entity in the code
+type Symbol struct {
+	Name      string
+	Kind      string // "variable", "function", "class", etc.
+	Type      string
+	IsExported bool
+	References []*Node
+	Definition *Node
+	Scope      *SymbolTable
+}
+
+// SymbolTable for tracking symbols and scopes
+type SymbolTable struct {
+	Symbols map[string]*Symbol
+	Parent  *SymbolTable
+	Children []*SymbolTable
+	Node     *Node // AST node associated with this scope
+}
+
+// NewSymbolTable creates a new symbol table
+func NewSymbolTable(parent *SymbolTable) *SymbolTable {
+	st := &SymbolTable{
+		Symbols:  make(map[string]*Symbol),
+		Parent:   parent,
+		Children: []*SymbolTable{},
+	}
+	if parent != nil {
+		parent.Children = append(parent.Children, st)
+	}
+	return st
+}
+
+// Add adds a symbol to the table
+func (st *SymbolTable) Add(name, kind, symbolType string, node *Node) *Symbol {
+	sym := &Symbol{
+		Name:       name,
+		Kind:       kind,
+		Type:       symbolType,
+		Definition: node,
+		Scope:      st,
+	}
+	st.Symbols[name] = sym
+	if node != nil {
+		node.Symbol = sym
+	}
+	return sym
+}
+
+// Lookup finds a symbol in this table or a parent table
+func (st *SymbolTable) Lookup(name string) *Symbol {
+	if sym, ok := st.Symbols[name]; ok {
+		return sym
+	}
+	if st.Parent != nil {
+		return st.Parent.Lookup(name)
+	}
+	return nil
+}
+
+// Parser factory
 func ParserFactory(language string) (Parser, error) {
 	switch strings.ToLower(language) {
 	case "js", "javascript":
@@ -28,9 +121,47 @@ func ParserFactory(language string) (Parser, error) {
 		return &CPPParser{}, nil
 	case "ts", "typescript":
 		return &TypeScriptParser{}, nil
+	case "php":
+		return &PHPParser{}, nil
+	case "ruby":
+		return &RubyParser{}, nil
+	case "rust":
+		return &RustParser{}, nil
+	case "cs", "csharp":
+		return &CSharpParser{}, nil
+	case "swift":
+		return &SwiftParser{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported language: %s", language)
 	}
+}
+
+// ParserCache for improving performance
+var (
+	parserCache = make(map[string]*Node)
+	cacheMutex  sync.RWMutex
+)
+
+// ParseWithCache parses with caching
+func ParseWithCache(parser Parser, source string) (*Node, error) {
+	cacheKey := fmt.Sprintf("%s_%x", parser.GetLanguage(), sha256.Sum256([]byte(source)))
+	
+	// Check cache first
+	cacheMutex.RLock()
+	if cachedNode, exists := parserCache[cacheKey]; exists {
+		cacheMutex.RUnlock()
+		return cachedNode, nil
+	}
+	cacheMutex.RUnlock()
+	
+	// Parse and cache the result
+	node, err := parser.Parse(source)
+	if err == nil {
+		cacheMutex.Lock()
+		parserCache[cacheKey] = node
+		cacheMutex.Unlock()
+	}
+	return node, err
 }
 
 // BasicParser implements common functionality for all parsers
@@ -41,6 +172,7 @@ type BasicParser struct {
 	column   int
 	current  byte
 	keywords map[string]bool // Language-specific keywords
+	options  ParserOptions
 }
 
 // Initialize sets up the parser with the given source
@@ -52,6 +184,12 @@ func (p *BasicParser) Initialize(source string) {
 	if len(source) > 0 {
 		p.current = source[0]
 	}
+	p.keywords = make(map[string]bool)
+}
+
+// SetOptions sets parser configuration options
+func (p *BasicParser) SetOptions(options ParserOptions) {
+	p.options = options
 }
 
 // Advance moves to the next character
@@ -203,4 +341,66 @@ func (p *BasicParser) ParseIdentifier() (string, error) {
 	}
 	
 	return identifier, nil
+}
+
+// Default implementations for specialized parsing methods
+func (p *BasicParser) ParseExpression(source string) (*Node, error) {
+	p.Initialize(source)
+	// This should be overridden by language-specific parsers
+	return nil, fmt.Errorf("ParseExpression not implemented for this language")
+}
+
+func (p *BasicParser) ParseStatement(source string) (*Node, error) {
+	p.Initialize(source)
+	// This should be overridden by language-specific parsers
+	return nil, fmt.Errorf("ParseStatement not implemented for this language")
+}
+
+func (p *BasicParser) ParseType(source string) (*Node, error) {
+	p.Initialize(source)
+	// This should be overridden by language-specific parsers
+	return nil, fmt.Errorf("ParseType not implemented for this language")
+}
+
+// GetContext extracts a context snippet for error messages
+func (p *BasicParser) GetContext(lineNum, col int, contextSize int) string {
+	lines := strings.Split(p.source, "\n")
+	if lineNum <= 0 || lineNum > len(lines) {
+		return ""
+	}
+	
+	start := max(1, lineNum-contextSize)
+	end := min(len(lines), lineNum+contextSize)
+	
+	var result strings.Builder
+	for i := start; i <= end; i++ {
+		lineStr := lines[i-1]
+		result.WriteString(fmt.Sprintf("%4d | %s\n", i, lineStr))
+		
+		if i == lineNum {
+			// Add pointer to the error position
+			result.WriteString("     | ")
+			for j := 1; j < col; j++ {
+				result.WriteString(" ")
+			}
+			result.WriteString("^\n")
+		}
+	}
+	
+	return result.String()
+}
+
+// Helper functions
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
